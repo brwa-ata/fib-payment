@@ -3,8 +3,10 @@
 from decimal import Decimal
 
 import pytest
+from django.core.exceptions import ImproperlyConfigured
 
 from fib_payment import conf, service
+from fib_payment.exceptions import FIBAPIError, FIBError
 
 from . import hooks
 from .testapp.models import Receipt
@@ -60,12 +62,16 @@ def test_a_receipt_without_an_invoice_is_described_by_its_id(fib):
     )
 
 
-def test_an_answer_without_a_payment_id_changes_nothing(fib):
+def test_an_answer_without_a_payment_id_is_a_fib_error(fib):
+    """Callers catch FIBError; a malformed answer must not escape as a 500."""
     fib.create_payment.return_value = {'unexpected': True}
     receipt = Receipt.objects.create(amount=1, is_completed=True)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(FIBError) as raised:
         service.start_payment(receipt, callback_url=CALLBACK_URL)
+
+    assert isinstance(raised.value, FIBAPIError)
+    assert raised.value.payload == {'unexpected': True}
 
     receipt.refresh_from_db()
     assert receipt.ref_no is None
@@ -156,3 +162,43 @@ def test_the_receipt_model_and_fields_come_from_settings():
     assert service.get_receipt_model() is Receipt
     assert conf.get_conf().ref_field == 'ref_no'
     assert conf.get_conf().status_field == 'is_completed'
+
+
+def test_the_receipt_model_must_be_set(settings):
+    settings.FIB_RECEIPT_MODEL = ''
+    conf.reset()
+
+    with pytest.raises(ImproperlyConfigured):
+        service.get_receipt_model()
+
+
+def test_refunded_runs_the_refunded_hook_and_leaves_the_receipt(fib):
+    receipt = Receipt.objects.create(amount=1, ref_no='PAY-1', is_completed=True)
+    fib.get_status.return_value = {'status': 'REFUNDED'}
+
+    service.sync_status(receipt)
+
+    assert completed(receipt)
+    assert hooks.refunded_calls == [(receipt.pk, 'REFUNDED')]
+    assert hooks.failed_calls == []
+
+
+@pytest.mark.parametrize(
+    ('call', 'client_call'),
+    [
+        ('cancel_payment', 'cancel'),
+        ('refund_payment', 'refund'),
+    ],
+)
+def test_cancel_and_refund_go_to_fib_with_the_receipts_payment(fib, call, client_call):
+    receipt = Receipt.objects.create(amount=1, ref_no='PAY-1')
+    getattr(fib, client_call).return_value = {'ok': True}
+
+    assert getattr(service, call)(receipt) == {'ok': True}
+    getattr(fib, client_call).assert_called_once_with('PAY-1')
+
+
+@pytest.mark.parametrize('call', ['cancel_payment', 'refund_payment'])
+def test_cancel_and_refund_need_a_payment(fib, call):
+    with pytest.raises(ValueError):
+        getattr(service, call)(Receipt.objects.create(amount=1))

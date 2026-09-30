@@ -10,19 +10,24 @@ Both field names and the model itself are configurable (see :mod:`fib_payment.co
 so this file never imports the project's model directly.
 """
 
-import logging
-
 from django.apps import apps
+from django.core.exceptions import ImproperlyConfigured
 from django.db import transaction
 from django.utils.module_loading import import_string
 
 from .conf import get_client, get_conf
-
-logger = logging.getLogger('custom.logger')
+from .exceptions import FIBAPIError
+from .logs import logger
 
 
 def get_receipt_model():
-    return apps.get_model(get_conf().receipt_model)
+    model = get_conf().receipt_model
+    if not model:
+        raise ImproperlyConfigured(
+            'Set FIB_RECEIPT_MODEL to the model that records payments, '
+            "e.g. 'shop.Receipt'."
+        )
+    return apps.get_model(model)
 
 
 def _get_ref(receipt):
@@ -47,8 +52,12 @@ def start_payment(receipt, *, callback_url, description=None, amount=None):
 
     payment_id = response.get('paymentId')
     if not payment_id:
-        # surface the raw response so callers can see what FIB returned
-        raise ValueError(f'FIB create-payment returned no paymentId: {response}')
+        # surface the raw response so callers can see what FIB returned; a
+        # FIBError, so the caller's own `except FIBError` refuses it cleanly
+        raise FIBAPIError(
+            f'FIB create-payment returned no paymentId: {response}',
+            payload=response,
+        )
 
     setattr(receipt, conf.ref_field, payment_id)
     setattr(receipt, conf.status_field, False)
@@ -70,12 +79,48 @@ def sync_status(receipt):
     return status_payload
 
 
+def cancel_payment(receipt):
+    """Cancel ``receipt``'s FIB payment while it is still unpaid.
+
+    FIB declines it, and reports ``DECLINED`` from then on (which runs the
+    failed hook on the next sync or callback). Once paid, a payment can only
+    be refunded. Returns FIB's answer.
+    """
+    payment_id = _get_ref(receipt)
+    if not payment_id:
+        raise ValueError('Receipt has no FIB payment reference to cancel.')
+    response = get_client().cancel(payment_id)
+    logger.info('FIB payment %s cancelled for receipt %s', payment_id, receipt.pk)
+    return response
+
+
+def refund_payment(receipt):
+    """Ask FIB to refund ``receipt``'s paid payment in full.
+
+    FIB answers an error for a payment that is not ``PAID``. The status moves
+    to ``REFUND_REQUESTED`` and then ``REFUNDED`` (which runs the refunded
+    hook) once FIB has processed it, a few minutes later. Returns FIB's answer.
+    """
+    payment_id = _get_ref(receipt)
+    if not payment_id:
+        raise ValueError('Receipt has no FIB payment reference to refund.')
+    response = get_client().refund(payment_id)
+    logger.info(
+        'FIB refund requested for payment %s, receipt %s', payment_id, receipt.pk
+    )
+    return response
+
+
 @transaction.atomic
 def apply_status(receipt, status_value):
-    """Flip the receipt's status field based on a FIB payment status.
+    """Apply a FIB payment status to ``receipt``.
 
-    A completed payment sets the status field to ``True`` (idempotent). Hooks,
-    if configured, run only on the transition so side effects fire once.
+    * a paid status sets the status field to ``True`` and runs the completion
+      hook, once: only on the pending -> completed transition;
+    * a failed status runs the failed hook; a refunded one, the refunded hook.
+      Neither touches the receipt, and both run every time the status is
+      applied (a callback and a poll can report it twice), so write those
+      hooks to be idempotent.
     """
     conf = get_conf()
     already_completed = getattr(receipt, conf.status_field)
@@ -88,6 +133,11 @@ def apply_status(receipt, status_value):
             logger.info('FIB payment for receipt %s marked completed', receipt.pk)
     elif status_value in conf.failed_statuses:
         _run_hook(conf.on_failed, receipt, status_value)
+        logger.info('FIB payment for receipt %s reported %s', receipt.pk, status_value)
+    elif status_value in conf.refunded_statuses:
+        # the receipt is left as it is: what a refund undoes (a balance, an
+        # order) is the project's to decide, in its refunded hook
+        _run_hook(conf.on_refunded, receipt, status_value)
         logger.info('FIB payment for receipt %s reported %s', receipt.pk, status_value)
     return receipt
 
@@ -127,5 +177,5 @@ def _run_hook(dotted_path, receipt, status_value):
         return
     try:
         import_string(dotted_path)(receipt, status_value)
-    except Exception:  # a hook must never break payment flow
+    except Exception:  # noqa: BLE001 - a hook must never break payment flow
         logger.exception('FIB payment hook %s failed', dotted_path)

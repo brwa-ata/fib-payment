@@ -1,6 +1,6 @@
 [project]
 name = "fib-payment"
-version = "0.1.0"
+version = "0.2.0"
 description = "FIB (First Iraqi Bank) Online Payment for Django: QR, readable code and app-link payments that complete a receipt once FIB confirms them."
 readme = "README.md"
 authors = [

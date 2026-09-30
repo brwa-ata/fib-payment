@@ -57,6 +57,7 @@ cannot be declined, only refunded.
 | `conf.py` | Reads the `FIB_*` settings once and builds one shared client |
 | `service.py` | Ties the client to your receipt model: start, sync, complete, callback |
 | `views.py` / `urls.py` | The callback FIB calls, plus two staff endpoints (see [HTTP endpoints](#http-endpoints)) |
+| `logs.py` | The `fib_payment` logger, and the optional log file |
 | `exceptions.py` | `FIBError`, `FIBAuthError`, `FIBAPIError` |
 
 The package has no models and no migrations.
@@ -123,7 +124,7 @@ The package never imports your model. It needs a model with a field for FIB's
 `paymentId` and a boolean that stays `False` until FIB confirms the payment:
 
 ```python
-FIB_RECEIPT_MODEL = 'shop.Receipt'        # default 'api.Receipt', see Known limits
+FIB_RECEIPT_MODEL = 'shop.Receipt'        # required
 FIB_RECEIPT_REF_FIELD = 'ref_no'          # default
 FIB_RECEIPT_STATUS_FIELD = 'is_completed' # default
 
@@ -131,17 +132,31 @@ FIB_RECEIPT_STATUS_FIELD = 'is_completed' # default
 FIB_ON_PAYMENT_COMPLETED = 'shop.payments.on_fib_paid'
 # Optional: run whenever FIB reports a failed status (DECLINED by default)
 FIB_ON_PAYMENT_FAILED = 'shop.payments.on_fib_failed'
+# Optional: run whenever FIB reports a refunded status (REFUNDED by default)
+FIB_ON_PAYMENT_REFUNDED = 'shop.payments.on_fib_refunded'
 ```
 
 A hook is `fn(receipt, status_value)`. An exception inside a hook is logged
-and swallowed: it never undoes a payment FIB has already confirmed.
+and swallowed: it never undoes a payment FIB has already confirmed. Only the
+completion hook is guaranteed to run once; the failed and refunded hooks run
+each time that status is read (a callback and a poll can both see it), so
+make them idempotent. The package never un-completes a refunded receipt:
+what a refund undoes (a balance, an order) is the project's to decide, in its
+refunded hook.
 
-### 5. Write the "start payment" and "status" endpoints
+### 5. Choose where the log goes (optional)
+
+```python
+FIB_LOG_FILE = BASE_DIR / 'logs' / 'fib_payment.log'   # or 'fib_payment.log'
+```
+
+See [Logging](#logging); without it the package writes no file.
+
+### 6. Write the "start payment" and "status" endpoints
 
 Creating the receipt stays in the project, because only the project knows who
 pays, how much, and what the receipt means. A customer-facing pair looks like
-this (Lavender's `basket/fib-payment/` and `basket/fib-status/` are the
-reference):
+this:
 
 ```python
 from django.db import transaction
@@ -198,13 +213,18 @@ Pass `amount=` to `start_payment` to charge something other than
 | `FIB_REFUNDABLE_FOR` | `P7D` | ISO-8601 window in which a payment can be refunded |
 | `FIB_TIMEOUT` | `30` | HTTP timeout, seconds |
 | `FIB_CALLBACK_URL` | *(blank)* | Absolute callback URL; blank builds `<host>/api/fib/callback/` from the request |
-| `FIB_RECEIPT_MODEL` | `api.Receipt` | `app_label.Model` holding payments |
+| `FIB_RECEIPT_MODEL` | *(none, required)* | `app_label.Model` holding payments |
 | `FIB_RECEIPT_REF_FIELD` | `ref_no` | Field that stores FIB's `paymentId` |
 | `FIB_RECEIPT_STATUS_FIELD` | `is_completed` | Boolean completed by a `PAID` status |
 | `FIB_PAID_STATUSES` | `('PAID',)` | Statuses that complete a receipt |
 | `FIB_FAILED_STATUSES` | `('DECLINED',)` | Statuses that run the failed hook |
+| `FIB_REFUNDED_STATUSES` | `('REFUNDED',)` | Statuses that run the refunded hook |
 | `FIB_ON_PAYMENT_COMPLETED` | *(blank)* | Dotted path to `fn(receipt, status)`, run once on completion |
 | `FIB_ON_PAYMENT_FAILED` | *(blank)* | Dotted path to `fn(receipt, status)`, run on a failed status |
+| `FIB_ON_PAYMENT_REFUNDED` | *(blank)* | Dotted path to `fn(receipt, status)`, run on a refunded status |
+| `FIB_LOG_FILE` | *(blank)* | File the package writes its log to; relative paths start at `BASE_DIR`. Blank: no file |
+| `FIB_LOG_LEVEL` | `INFO` | Lowest level written to `FIB_LOG_FILE` |
+| `FIB_VIEW_PERMISSION_CLASSES` | `['rest_framework.permissions.IsAdminUser']` | Dotted paths of the DRF permissions guarding the two `payments/` endpoints |
 
 Settings are read once per process (`conf.get_conf()`), so restart the app
 server and every worker after changing them. In tests, call
@@ -218,12 +238,15 @@ Mounted under whatever prefix the project gives `fib_payment.urls`
 | Endpoint | Who | What |
 | --- | --- | --- |
 | `POST api/fib/callback/` | FIB (public) | Body `{"id": "<paymentId>", "status": "..."}` (`paymentId` is accepted too). Re-reads the status from FIB and applies it. `200` done, `400` no id, `503` FIB could not be reached, so FIB retries |
-| `POST api/fib/payments/` | Logged in | `{"receipt_id": ...}`: starts a payment for an existing pending receipt. Answers FIB's `paymentId`, `readableCode`, `qrCode`, `validUntil` and the three app links; `422` without `receipt_id`, `502` if FIB refuses |
-| `GET api/fib/payments/<receipt pk>/status/` | Logged in | Re-syncs and answers `{status, is_completed, payment}`; `502` if FIB refuses |
+| `POST api/fib/payments/` | Staff | `{"receipt_id": ...}`: starts a payment for an existing pending receipt. Answers FIB's `paymentId`, `readableCode`, `qrCode`, `validUntil` and the three app links; `422` without `receipt_id`, `502` if FIB refuses |
+| `GET api/fib/payments/<receipt pk>/status/` | Staff | Re-syncs and answers `{status, is_completed, payment}` (the payer's name and IBAN included); `502` if FIB refuses |
 
-The two `payments/` endpoints check only that the caller is logged in, not
-that the receipt is theirs: keep them for staff, and give customers endpoints
-of your own that scope the receipt to the caller (step 5 above).
+The two `payments/` endpoints find a receipt by its id alone, so they are for
+staff: by default only `is_staff` users may call them. Set
+`FIB_VIEW_PERMISSION_CLASSES` to change who may, and give customers endpoints
+of your own that scope the receipt to the caller (step 6 above). There is no
+endpoint for cancel or refund, since who may refund is the project's call; use
+`service.cancel_payment()` / `service.refund_payment()` from a view of yours.
 
 ## Tracking the status
 
@@ -266,11 +289,16 @@ service.apply_status(receipt, 'PAID')
 
 # What the callback view calls; returns the receipt, or None if unknown.
 service.handle_callback(payment_id, claimed_status=None)
+
+# Cancel an unpaid payment, or refund a paid one; both return FIB's answer.
+service.cancel_payment(receipt)
+service.refund_payment(receipt)
 ```
 
-`start_payment` raises `ValueError` if FIB answers without a `paymentId`, and
-`sync_status` raises `ValueError` for a receipt with no reference; FIB
-failures raise the exceptions below.
+Every FIB failure raises a `FIBError` (below), including an answer to
+create-payment that carries no `paymentId`. Calling `sync_status`,
+`cancel_payment` or `refund_payment` on a receipt with no reference raises
+`ValueError`: that is a bug in the caller, not something FIB said.
 
 ### `fib_payment.client.FIBPaymentClient` (no Django)
 
@@ -322,16 +350,33 @@ guarded by a lock, so one client can be shared between threads.
 
 ## Logging
 
-The package logs to the **`custom.logger`** logger (payments created and
-completed, callbacks, hook failures). That name comes from the Lavender app
-it was extracted from. Route it in `LOGGING`, or it propagates to the root
-logger:
+Everything is logged to the **`fib_payment`** logger: payments created,
+completed, failed, refunded or cancelled, callbacks, and hook failures. Pick
+one of:
 
-```python
-LOGGING['loggers']['custom.logger'] = {
-    'handlers': ['file'], 'level': 'INFO', 'propagate': False,
-}
-```
+- **Let the package write a file**, wherever the project keeps its logs:
+
+  ```python
+  FIB_LOG_FILE = BASE_DIR / 'logs' / 'fib_payment.log'   # a logs/ folder
+  FIB_LOG_FILE = 'fib_payment.log'                        # the project root
+  FIB_LOG_LEVEL = 'INFO'                                  # default
+  ```
+
+  A relative path starts at `BASE_DIR`, a missing folder is created, and the
+  file is only created once something is logged. Those records then go to
+  that file only, not to the root logger.
+
+- **Route the logger yourself** in `LOGGING`, e.g. into a file the project
+  already has:
+
+  ```python
+  LOGGING['loggers']['fib_payment'] = {
+      'handlers': ['file'], 'level': 'INFO', 'propagate': False,
+  }
+  ```
+
+- **Neither**: no file is written. Python drops `INFO` records and prints
+  warnings and errors to stderr, as for any logger nobody configured.
 
 ## Testing
 
@@ -385,15 +430,10 @@ How to release a new version and move a project onto it:
 
 ## Known limits
 
-These are kept from the Lavender app on purpose, so that moving to the
-package changed nothing; a later minor release can clean them up (with
-upgrade notes).
-
-- `FIB_RECEIPT_MODEL` defaults to `api.Receipt`, Lavender's model. Other
-  projects must set it.
-- Logs go to `custom.logger` rather than a logger named after the package.
-- If FIB answers create-payment without a `paymentId`, `start_payment` raises
-  `ValueError`, which the `payments/` endpoint does not catch (a `500`).
-- Cancel and refund exist on the client only; no endpoint exposes them, and a
-  `REFUNDED` status does not un-complete a receipt.
-- `__init__.py` still sets `default_app_config`, which Django 4.1+ ignores.
+- The status is read from FIB on every poll and callback; the package keeps
+  no history of a payment's statuses. The status answer (`sync_status`'s
+  return value) is the place to read `paidAt` and `paidBy` from.
+- `REFUNDED` does not un-complete a receipt; the refunded hook is where a
+  project undoes what the payment did.
+- Amounts are sent in the currency set by `FIB_CURRENCY`; one project, one
+  currency.

@@ -23,7 +23,14 @@ def receipt():
 @pytest.fixture
 def staff():
     client = APIClient()
-    client.force_authenticate(User.objects.create_user('staff'))
+    client.force_authenticate(User.objects.create_user('staff', is_staff=True))
+    return client
+
+
+@pytest.fixture
+def customer():
+    client = APIClient()
+    client.force_authenticate(User.objects.create_user('customer'))
     return client
 
 
@@ -135,3 +142,21 @@ def test_a_failed_status_check_is_a_502(staff, fib, receipt):
     response = staff.get(f'{PAYMENTS_URL}{receipt.pk}/status/')
 
     assert response.status_code == 502
+
+
+def test_the_payment_endpoints_are_for_staff_by_default(customer, fib, receipt):
+    """They find a receipt by id alone, so a customer must not reach them."""
+    assert customer.post(PAYMENTS_URL, {'receipt_id': receipt.pk}).status_code == 403
+    assert customer.get(f'{PAYMENTS_URL}{receipt.pk}/status/').status_code == 403
+    fib.create_payment.assert_not_called()
+
+
+def test_who_may_call_them_is_a_setting(customer, fib, receipt, settings):
+    settings.FIB_VIEW_PERMISSION_CLASSES = [
+        'rest_framework.permissions.IsAuthenticated'
+    ]
+    conf.reset()
+
+    response = customer.get(f'{PAYMENTS_URL}{receipt.pk}/status/')
+
+    assert response.status_code == 200

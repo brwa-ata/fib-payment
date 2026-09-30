@@ -6,13 +6,14 @@
 
 The payment endpoints operate on a receipt that the project has already
 created (pending, ``is_completed=False``). Creating that receipt stays in the
-project so this app never needs to know how receipts are built.
+project so this app never needs to know how receipts are built. They look a
+receipt up by id alone, so they are for staff: ``FIB_VIEW_PERMISSION_CLASSES``
+decides who may call them (``IsAdminUser`` unless the project says otherwise).
 """
-
-import logging
 
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
+from django.utils.module_loading import import_string
 from rest_framework import permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -20,8 +21,7 @@ from rest_framework.views import APIView
 from . import service
 from .conf import get_conf
 from .exceptions import FIBError
-
-logger = logging.getLogger('custom.logger')
+from .logs import logger
 
 # fields from FIB's create-payment response worth returning to a client
 _PAYMENT_FIELDS = (
@@ -42,10 +42,15 @@ def _callback_url(request):
     return request.build_absolute_uri(reverse('fib-callback'))
 
 
-class FIBStartPaymentView(APIView):
-    """Start a FIB payment for an existing, pending receipt."""
+class ProjectPermissionsMixin:
+    """Take the permission classes from ``FIB_VIEW_PERMISSION_CLASSES``."""
 
-    permission_classes = [permissions.IsAuthenticated]
+    def get_permissions(self):
+        return [import_string(path)() for path in get_conf().view_permission_classes]
+
+
+class FIBStartPaymentView(ProjectPermissionsMixin, APIView):
+    """Start a FIB payment for an existing, pending receipt."""
 
     def post(self, request):
         receipt_id = request.data.get('receipt_id')
@@ -69,10 +74,8 @@ class FIBStartPaymentView(APIView):
         )
 
 
-class FIBPaymentStatusView(APIView):
+class FIBPaymentStatusView(ProjectPermissionsMixin, APIView):
     """Re-sync a receipt's payment against FIB and return the status."""
-
-    permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, pk):
         conf = get_conf()

@@ -13,6 +13,7 @@ def fresh_state():
     conf.reset()
     hooks.calls.clear()
     hooks.failed_calls.clear()
+    hooks.refunded_calls.clear()
     yield
     conf.reset()
 
